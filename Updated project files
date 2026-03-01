@@ -1,0 +1,624 @@
+import pygame
+import heapq
+import math
+import random
+import time
+import sys
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+CELL = 30          # pixel size of each cell
+PANEL_W = 280      # right-side control panel width
+FPS = 30
+
+# Colors
+BG         = (18,  18,  30)
+GRID_LINE  = (40,  40,  60)
+EMPTY      = (28,  28,  45)
+WALL       = (60,  60,  80)
+START_C    = (50, 220, 120)
+GOAL_C     = (255, 80,  80)
+FRONTIER_C = (255, 210,  50)
+VISITED_C  = (80, 130, 220)
+PATH_C     = (50, 240, 140)
+PANEL_BG   = (22,  22,  38)
+ACCENT     = (100, 180, 255)
+TEXT_C     = (210, 210, 230)
+BTN_C      = (45,  45,  70)
+BTN_HOV    = (65,  65, 100)
+BTN_ACT    = (70, 130, 200)
+WHITE      = (255, 255, 255)
+OBSTACLE_SPAWN = (200, 80,  80)
+
+# ─── Grid ─────────────────────────────────────────────────────────────────────
+class Grid:
+    def __init__(self, rows, cols):
+        self.rows = rows
+        self.cols = cols
+        self.walls = set()
+        self.start = (0, 0)
+        self.goal  = (rows-1, cols-1)
+
+    def in_bounds(self, r, c):
+        return 0 <= r < self.rows and 0 <= c < self.cols
+
+    def neighbors(self, r, c):
+        for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+            nr, nc = r+dr, c+dc
+            if self.in_bounds(nr, nc) and (nr, nc) not in self.walls:
+                yield (nr, nc)
+
+    def random_maze(self, density=0.30):
+        self.walls.clear()
+        total = self.rows * self.cols
+        candidates = [
+            (r, c) for r in range(self.rows) for c in range(self.cols)
+            if (r, c) != self.start and (r, c) != self.goal
+        ]
+        n_walls = int(total * density)
+        chosen = random.sample(candidates, min(n_walls, len(candidates)))
+        self.walls = set(chosen)
+
+    def toggle_wall(self, r, c):
+        if (r, c) in (self.start, self.goal):
+            return
+        if (r, c) in self.walls:
+            self.walls.discard((r, c))
+        else:
+            self.walls.add((r, c))
+
+# ─── Heuristics ───────────────────────────────────────────────────────────────
+def manhattan(a, b):
+    return abs(a[0]-b[0]) + abs(a[1]-b[1])
+
+def euclidean(a, b):
+    return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2)
+
+# ─── Search algorithms (generator-based for step visualization) ───────────────
+def gbfs(grid, heuristic):
+    """Greedy Best-First Search – yields (frontier_set, visited_set, path_or_None, done)"""
+    start, goal = grid.start, grid.goal
+    h = heuristic
+    frontier = []
+    heapq.heappush(frontier, (h(start, goal), start))
+    came_from = {start: None}
+    frontier_set = {start}
+    visited = set()
+
+    while frontier:
+        _, current = heapq.heappop(frontier)
+        frontier_set.discard(current)
+        if current in visited:
+            continue
+        visited.add(current)
+
+        if current == goal:
+            path = []
+            node = goal
+            while node:
+                path.append(node)
+                node = came_from[node]
+            path.reverse()
+            yield frontier_set.copy(), visited.copy(), path, True
+            return
+
+        for nb in grid.neighbors(*current):
+            if nb not in visited and nb not in came_from:
+                came_from[nb] = current
+                heapq.heappush(frontier, (h(nb, goal), nb))
+                frontier_set.add(nb)
+
+        yield frontier_set.copy(), visited.copy(), None, False
+
+    yield set(), visited.copy(), None, True  # no path
+
+
+def astar(grid, heuristic):
+    """A* Search"""
+    start, goal = grid.start, grid.goal
+    h = heuristic
+    frontier = []
+    heapq.heappush(frontier, (h(start, goal), 0, start))
+    came_from = {start: None}
+    g_score = {start: 0}
+    frontier_set = {start}
+    visited = set()
+
+    while frontier:
+        f, g, current = heapq.heappop(frontier)
+        frontier_set.discard(current)
+        if current in visited:
+            continue
+        visited.add(current)
+
+        if current == goal:
+            path = []
+            node = goal
+            while node:
+                path.append(node)
+                node = came_from[node]
+            path.reverse()
+            yield frontier_set.copy(), visited.copy(), path, True
+            return
+
+        for nb in grid.neighbors(*current):
+            if nb in visited:
+                continue
+            tentative_g = g_score[current] + 1
+            if tentative_g < g_score.get(nb, float('inf')):
+                came_from[nb] = current
+                g_score[nb] = tentative_g
+                f_new = tentative_g + h(nb, goal)
+                heapq.heappush(frontier, (f_new, tentative_g, nb))
+                frontier_set.add(nb)
+
+        yield frontier_set.copy(), visited.copy(), None, False
+
+    yield set(), visited.copy(), None, True
+
+
+def run_search_instant(grid, algorithm, heuristic):
+    """Run search to completion and return metrics."""
+    gen = algorithm(grid, heuristic)
+    frontier_set = set()
+    visited = set()
+    path = None
+    t0 = time.time()
+    while True:
+        frontier_set, visited, path, done = next(gen)
+        if done:
+            break
+    elapsed = (time.time() - t0) * 1000
+    return frontier_set, visited, path, elapsed
+
+# ─── UI Helpers ───────────────────────────────────────────────────────────────
+class Button:
+    def __init__(self, rect, label, active=False):
+        self.rect = pygame.Rect(rect)
+        self.label = label
+        self.active = active
+        self.hovered = False
+
+    def draw(self, surf, font):
+        color = BTN_ACT if self.active else (BTN_HOV if self.hovered else BTN_C)
+        pygame.draw.rect(surf, color, self.rect, border_radius=6)
+        pygame.draw.rect(surf, ACCENT if self.active else GRID_LINE, self.rect, 1, border_radius=6)
+        txt = font.render(self.label, True, WHITE)
+        surf.blit(txt, txt.get_rect(center=self.rect.center))
+
+    def check_hover(self, pos):
+        self.hovered = self.rect.collidepoint(pos)
+
+    def is_clicked(self, pos, event):
+        return event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self.rect.collidepoint(pos)
+
+
+def draw_text(surf, font, text, pos, color=TEXT_C, anchor="topleft"):
+    s = font.render(text, True, color)
+    r = s.get_rect(**{anchor: pos})
+    surf.blit(s, r)
+
+# ─── Main App ─────────────────────────────────────────────────────────────────
+class App:
+    def __init__(self):
+        pygame.init()
+        self.rows = 20
+        self.cols = 25
+        self.grid = Grid(self.rows, self.cols)
+
+        # Window
+        self.grid_w = self.cols * CELL
+        self.grid_h = self.rows * CELL
+        self.win_w  = self.grid_w + PANEL_W
+        self.win_h  = self.grid_h
+        self.screen = pygame.display.set_mode((self.win_w, self.win_h), pygame.RESIZABLE)
+        pygame.display.set_caption("Dynamic Pathfinding Agent")
+
+        self.font_sm  = pygame.font.SysFont("consolas", 13)
+        self.font_med = pygame.font.SysFont("consolas", 15, bold=True)
+        self.font_lg  = pygame.font.SysFont("consolas", 17, bold=True)
+
+        # State
+        self.algorithm = "astar"   # "astar" | "gbfs"
+        self.heuristic = "manhattan"  # "manhattan" | "euclidean"
+        self.density   = 0.30
+        self.dynamic   = False
+        self.spawn_prob = 0.05
+        self.step_delay = 30  # ms between visualization steps
+        self.place_mode = "wall"   # "wall" | "start" | "goal"
+
+        self.frontier_vis = set()
+        self.visited_vis  = set()
+        self.path_vis     = []
+        self.agent_pos    = None
+        self.agent_step   = 0
+        self.agent_moving = False
+        self.metrics = {"nodes": 0, "cost": 0, "time_ms": 0.0}
+        self.status = "Ready. Generate a map or draw walls, then Run."
+        self.gen = None           # step generator
+        self.stepping = False
+        self.done = False
+        self.new_walls_flash = set()  # recently spawned walls
+
+        self._build_buttons()
+
+    def _build_buttons(self):
+        px = self.grid_w + 10
+        bw, bh = PANEL_W - 20, 30
+        y = 10
+
+        def B(label, active=False):
+            nonlocal y
+            b = Button((px, y, bw, bh), label, active)
+            y += bh + 6
+            return b
+
+        def sep():
+            nonlocal y
+            y += 10
+
+        self.btn_astar  = B("Algorithm: A*",  self.algorithm=="astar")
+        self.btn_gbfs   = B("Algorithm: GBFS", self.algorithm=="gbfs")
+        sep()
+        self.btn_manh   = B("Heuristic: Manhattan", self.heuristic=="manhattan")
+        self.btn_eucl   = B("Heuristic: Euclidean", self.heuristic=="euclidean")
+        sep()
+        self.btn_gen    = B("Generate Random Map")
+        self.btn_clear  = B("Clear Walls")
+        sep()
+        self.btn_run    = B("▶  Run Search")
+        self.btn_step   = B("⏭  Step Mode")
+        self.btn_reset  = B("↺  Reset View")
+        sep()
+        self.btn_dynamic = B("Dynamic Mode: OFF")
+        sep()
+        self.btn_place_wall  = B("Place: Wall", self.place_mode=="wall")
+        self.btn_place_start = B("Place: Start", self.place_mode=="start")
+        self.btn_place_goal  = B("Place: Goal",  self.place_mode=="goal")
+
+        self.all_buttons = [
+            self.btn_astar, self.btn_gbfs,
+            self.btn_manh, self.btn_eucl,
+            self.btn_gen, self.btn_clear,
+            self.btn_run, self.btn_step, self.btn_reset,
+            self.btn_dynamic,
+            self.btn_place_wall, self.btn_place_start, self.btn_place_goal,
+        ]
+        self.metrics_y = y + 10
+
+    def h(self):
+        return manhattan if self.heuristic == "manhattan" else euclidean
+
+    def algo(self):
+        return astar if self.algorithm == "astar" else gbfs
+
+    def _reset_vis(self):
+        self.frontier_vis = set()
+        self.visited_vis  = set()
+        self.path_vis     = []
+        self.agent_pos    = None
+        self.agent_step   = 0
+        self.agent_moving = False
+        self.gen = None
+        self.stepping = False
+        self.done = False
+        self.new_walls_flash = set()
+        self.metrics = {"nodes": 0, "cost": 0, "time_ms": 0.0}
+
+    def _start_agent(self, path):
+        if path and len(path) > 1:
+            self.path_vis = path
+            self.agent_pos = path[0]
+            self.agent_step = 0
+            self.agent_moving = True
+
+    def _spawn_dynamic_obstacles(self):
+        """Spawn obstacles along non-path cells; return True if path blocked."""
+        if not self.agent_moving or not self.path_vis:
+            return False
+        path_set = set(self.path_vis[self.agent_step:])
+        blocked = False
+        for r in range(self.grid.rows):
+            for c in range(self.grid.cols):
+                pos = (r, c)
+                if pos in path_set or pos in (self.grid.start, self.grid.goal):
+                    continue
+                if pos in self.grid.walls:
+                    continue
+                if random.random() < self.spawn_prob:
+                    self.grid.walls.add(pos)
+                    self.new_walls_flash.add(pos)
+                    if pos in path_set:
+                        blocked = True
+        return blocked
+
+    def _replan(self):
+        """Re-plan from current agent position."""
+        old_start = self.grid.start
+        self.grid.start = self.agent_pos
+        _, vis, path, elapsed = run_search_instant(self.grid, self.algo(), self.h())
+        self.grid.start = old_start
+        self.visited_vis = vis
+        self.metrics["nodes"] += len(vis)
+        self.metrics["time_ms"] += elapsed
+        if path:
+            self.path_vis = path
+            self.agent_step = 0
+            self.status = "Path blocked! Re-planned successfully."
+        else:
+            self.agent_moving = False
+            self.status = "No path found after re-plan!"
+
+    def run(self):
+        clock = pygame.time.Clock()
+        agent_timer = 0
+        agent_move_delay = 120  # ms per step
+
+        while True:
+            dt = clock.tick(FPS)
+            mpos = pygame.mouse.get_pos()
+            for btn in self.all_buttons:
+                btn.check_hover(mpos)
+
+            events = pygame.event.get()
+            for e in events:
+                if e.type == pygame.QUIT:
+                    pygame.quit(); sys.exit()
+                if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
+                    pygame.quit(); sys.exit()
+
+                self._handle_event(e, mpos)
+
+            # Step-mode advance
+            if self.stepping and self.gen and not self.done:
+                pass  # manual
+
+            # Auto-run stepping
+            if self.gen and not self.stepping and not self.done:
+                try:
+                    fs, vs, path, done = next(self.gen)
+                    self.frontier_vis = fs
+                    self.visited_vis  = vs
+                    self.metrics["nodes"] = len(vs)
+                    if done:
+                        self.done = True
+                        if path:
+                            self.path_vis = path
+                            self.metrics["cost"] = len(path) - 1
+                            self.status = f"Path found! Cost={self.metrics['cost']}, Nodes={self.metrics['nodes']}"
+                            self._start_agent(path)
+                        else:
+                            self.status = "No path exists!"
+                except StopIteration:
+                    self.done = True
+
+            # Agent movement
+            if self.agent_moving:
+                agent_timer += dt
+                if agent_timer >= agent_move_delay:
+                    agent_timer = 0
+                    self.agent_step += 1
+                    if self.agent_step >= len(self.path_vis):
+                        self.agent_moving = False
+                        self.status = "Goal reached!"
+                    else:
+                        self.agent_pos = self.path_vis[self.agent_step]
+                        # Dynamic obstacles
+                        if self.dynamic:
+                            blocked = self._spawn_dynamic_obstacles()
+                            if blocked:
+                                self._replan()
+
+            # Fade flash walls
+            self.new_walls_flash = set()
+
+            self._draw()
+            pygame.display.flip()
+
+    def _handle_event(self, e, mpos):
+        # Mouse on grid
+        if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+            gx, gy = mpos
+            if gx < self.grid_w and gy < self.grid_h:
+                r, c = gy // CELL, gx // CELL
+                if self.grid.in_bounds(r, c):
+                    if self.place_mode == "wall":
+                        self.grid.toggle_wall(r, c)
+                        self._reset_vis()
+                    elif self.place_mode == "start":
+                        if (r, c) not in self.grid.walls and (r, c) != self.grid.goal:
+                            self.grid.start = (r, c)
+                            self._reset_vis()
+                    elif self.place_mode == "goal":
+                        if (r, c) not in self.grid.walls and (r, c) != self.grid.start:
+                            self.grid.goal = (r, c)
+                            self._reset_vis()
+
+        # Drag walls
+        if e.type == pygame.MOUSEMOTION and pygame.mouse.get_pressed()[0]:
+            gx, gy = mpos
+            if gx < self.grid_w and gy < self.grid_h and self.place_mode == "wall":
+                r, c = gy // CELL, gx // CELL
+                if self.grid.in_bounds(r, c) and (r, c) not in (self.grid.start, self.grid.goal):
+                    self.grid.walls.add((r, c))
+                    self._reset_vis()
+
+        # Buttons
+        for btn in self.all_buttons:
+            if btn.is_clicked(mpos, e):
+                self._btn_click(btn)
+
+    def _btn_click(self, btn):
+        if btn == self.btn_astar:
+            self.algorithm = "astar"
+            self.btn_astar.active = True; self.btn_gbfs.active = False
+        elif btn == self.btn_gbfs:
+            self.algorithm = "gbfs"
+            self.btn_gbfs.active = True; self.btn_astar.active = False
+        elif btn == self.btn_manh:
+            self.heuristic = "manhattan"
+            self.btn_manh.active = True; self.btn_eucl.active = False
+        elif btn == self.btn_eucl:
+            self.heuristic = "euclidean"
+            self.btn_eucl.active = True; self.btn_manh.active = False
+        elif btn == self.btn_gen:
+            self.grid.random_maze(self.density)
+            self._reset_vis()
+            self.status = f"Random maze generated ({int(self.density*100)}% density)."
+        elif btn == self.btn_clear:
+            self.grid.walls.clear()
+            self._reset_vis()
+            self.status = "Walls cleared."
+        elif btn == self.btn_run:
+            self._reset_vis()
+            t0 = time.time()
+            self.gen = self.algo()(self.grid, self.h())
+            self.metrics["time_ms"] = 0.0
+            self.stepping = False
+            self.status = "Running..."
+        elif btn == self.btn_step:
+            if self.gen is None:
+                self._reset_vis()
+                self.gen = self.algo()(self.grid, self.h())
+                self.stepping = True
+                self.status = "Step mode – click Step to advance."
+            elif self.stepping and not self.done:
+                try:
+                    fs, vs, path, done = next(self.gen)
+                    self.frontier_vis = fs
+                    self.visited_vis  = vs
+                    self.metrics["nodes"] = len(vs)
+                    if done:
+                        self.done = True
+                        if path:
+                            self.path_vis = path
+                            self.metrics["cost"] = len(path) - 1
+                            self.status = f"Done! Cost={self.metrics['cost']}, Nodes={self.metrics['nodes']}"
+                            self._start_agent(path)
+                        else:
+                            self.status = "No path exists!"
+                except StopIteration:
+                    self.done = True
+        elif btn == self.btn_reset:
+            self._reset_vis()
+            self.status = "View reset."
+        elif btn == self.btn_dynamic:
+            self.dynamic = not self.dynamic
+            btn.label = f"Dynamic Mode: {'ON' if self.dynamic else 'OFF'}"
+            btn.active = self.dynamic
+            self.status = f"Dynamic obstacles {'enabled' if self.dynamic else 'disabled'}."
+        elif btn == self.btn_place_wall:
+            self.place_mode = "wall"
+            self.btn_place_wall.active = True
+            self.btn_place_start.active = False
+            self.btn_place_goal.active = False
+        elif btn == self.btn_place_start:
+            self.place_mode = "start"
+            self.btn_place_wall.active = False
+            self.btn_place_start.active = True
+            self.btn_place_goal.active = False
+        elif btn == self.btn_place_goal:
+            self.place_mode = "goal"
+            self.btn_place_wall.active = False
+            self.btn_place_start.active = False
+            self.btn_place_goal.active = True
+
+    def _draw(self):
+        self.screen.fill(BG)
+        self._draw_grid()
+        self._draw_panel()
+
+    def _draw_grid(self):
+        surf = self.screen
+        for r in range(self.grid.rows):
+            for c in range(self.grid.cols):
+                x, y = c*CELL, r*CELL
+                pos = (r, c)
+
+                if pos == self.grid.start:
+                    color = START_C
+                elif pos == self.grid.goal:
+                    color = GOAL_C
+                elif pos in self.grid.walls:
+                    color = WALL
+                elif pos in (self.path_vis or []):
+                    color = PATH_C
+                elif pos in self.frontier_vis:
+                    color = FRONTIER_C
+                elif pos in self.visited_vis:
+                    color = VISITED_C
+                else:
+                    color = EMPTY
+
+                pygame.draw.rect(surf, color, (x+1, y+1, CELL-2, CELL-2), border_radius=3)
+
+        # Draw grid lines
+        for r in range(self.grid.rows+1):
+            pygame.draw.line(surf, GRID_LINE, (0, r*CELL), (self.grid_w, r*CELL))
+        for c in range(self.grid.cols+1):
+            pygame.draw.line(surf, GRID_LINE, (c*CELL, 0), (c*CELL, self.grid_h))
+
+        # Agent
+        if self.agent_pos and self.agent_moving:
+            r, c = self.agent_pos
+            cx, cy = c*CELL + CELL//2, r*CELL + CELL//2
+            pygame.draw.circle(surf, WHITE, (cx, cy), CELL//3)
+            pygame.draw.circle(surf, START_C, (cx, cy), CELL//3 - 3)
+
+        # Labels
+        sr, sc = self.grid.start
+        gr, gc = self.grid.goal
+        draw_text(surf, self.font_sm, "S", (sc*CELL+CELL//2, sr*CELL+CELL//2), BG, anchor="center")
+        draw_text(surf, self.font_sm, "G", (gc*CELL+CELL//2, gr*CELL+CELL//2), BG, anchor="center")
+
+    def _draw_panel(self):
+        panel_rect = pygame.Rect(self.grid_w, 0, PANEL_W, self.grid_h)
+        pygame.draw.rect(self.screen, PANEL_BG, panel_rect)
+        pygame.draw.line(self.screen, ACCENT, (self.grid_w, 0), (self.grid_w, self.grid_h), 2)
+
+        for btn in self.all_buttons:
+            btn.draw(self.screen, self.font_sm)
+
+        # Metrics
+        my = self.metrics_y
+        px = self.grid_w + 10
+        draw_text(self.screen, self.font_lg, "── Metrics ──", (px, my), ACCENT)
+        my += 22
+        draw_text(self.screen, self.font_sm, f"Nodes Visited : {self.metrics['nodes']}", (px, my), TEXT_C); my += 18
+        draw_text(self.screen, self.font_sm, f"Path Cost     : {self.metrics['cost']}", (px, my), TEXT_C); my += 18
+        draw_text(self.screen, self.font_sm, f"Time (ms)     : {self.metrics['time_ms']:.2f}", (px, my), TEXT_C); my += 22
+
+        # Legend
+        draw_text(self.screen, self.font_lg, "── Legend ──", (px, my), ACCENT); my += 20
+        legend = [
+            (START_C,    "Start"),
+            (GOAL_C,     "Goal"),
+            (FRONTIER_C, "Frontier"),
+            (VISITED_C,  "Visited"),
+            (PATH_C,     "Path"),
+            (WALL,       "Wall"),
+        ]
+        for color, label in legend:
+            pygame.draw.rect(self.screen, color, (px, my, 14, 14), border_radius=3)
+            draw_text(self.screen, self.font_sm, label, (px+18, my), TEXT_C)
+            my += 18
+
+        # Status bar at bottom
+        my = self.grid_h - 50
+        draw_text(self.screen, self.font_lg, "── Status ──", (px, my), ACCENT); my += 18
+        # Word-wrap status
+        words = self.status.split()
+        line, lines = "", []
+        for w in words:
+            test = line + (" " if line else "") + w
+            if self.font_sm.size(test)[0] < PANEL_W - 20:
+                line = test
+            else:
+                lines.append(line); line = w
+        if line: lines.append(line)
+        for l in lines[:3]:
+            draw_text(self.screen, self.font_sm, l, (px, my), TEXT_C); my += 16
+
+
+if __name__ == "__main__":
+    app = App()
+    app.run()
